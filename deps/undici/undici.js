@@ -7262,7 +7262,6 @@ var require_client_h1 = __commonJS({
       finish() {
         assert(currentParser === null);
         assert(this.ptr != null);
-        assert(!this.paused);
         const { llhttp } = this;
         let ret;
         try {
@@ -8641,6 +8640,14 @@ var require_client_h2 = __commonJS({
     }
     __name(onUpgradeStreamClose, "onUpgradeStreamClose");
     function onRequestStreamClose() {
+      const state = this[kRequestStreamState];
+      if (state) {
+        releaseRequestStream(this);
+        if (state.pendingEnd && !state.request.aborted && !state.request.completed) {
+          state.request.onResponseEnd(state.trailers || {});
+          state.finalizeRequest();
+        }
+      }
       this.off("data", onData);
       this.off("error", noop);
       closeStreamSession(this);
@@ -9028,12 +9035,10 @@ var require_client_h2 = __commonJS({
       const state = stream[kRequestStreamState];
       const { request } = state;
       stream.off("end", onEnd);
-      releaseRequestStream(stream);
       if (state.responseReceived) {
         if (!request.aborted && !request.completed) {
-          request.onResponseEnd({});
+          state.pendingEnd = true;
         }
-        state.finalizeRequest();
       } else {
         state.abort(new InformationalError("HTTP/2: stream half-closed (remote)"), true);
       }
@@ -9043,7 +9048,6 @@ var require_client_h2 = __commonJS({
       const stream = this;
       const state = stream[kRequestStreamState];
       stream.off("error", onError);
-      releaseRequestStream(stream);
       state.abort(err);
     }
     __name(onError, "onError");
@@ -9051,7 +9055,6 @@ var require_client_h2 = __commonJS({
       const stream = this;
       const state = stream[kRequestStreamState];
       stream.off("frameError", onFrameError);
-      releaseRequestStream(stream);
       state.abort(new InformationalError(`HTTP/2: "frameError" received - type ${type}, code ${code}`));
     }
     __name(onFrameError, "onFrameError");
@@ -9062,7 +9065,7 @@ var require_client_h2 = __commonJS({
     function onTimeout() {
       const stream = this;
       const state = stream[kRequestStreamState];
-      releaseRequestStream(stream);
+      stream.off("timeout", onTimeout);
       const err = state.responseReceived ? new BodyTimeoutError(`HTTP/2: "stream timeout after ${state.bodyTimeout}"`) : new HeadersTimeoutError(`HTTP/2: "headers timeout after ${state.headersTimeout}"`);
       state.abort(err);
     }
@@ -9072,12 +9075,11 @@ var require_client_h2 = __commonJS({
       const state = stream[kRequestStreamState];
       const { request } = state;
       stream.off("trailers", onTrailers);
+      stream.off("data", onData);
       if (request.aborted || request.completed) {
         return;
       }
-      releaseRequestStream(stream);
-      request.onResponseEnd(trailers);
-      state.finalizeRequest();
+      state.trailers = trailers;
     }
     __name(onTrailers, "onTrailers");
     function writeBodyH2() {
@@ -9719,9 +9721,13 @@ var require_client = __commonJS({
         });
       }
       if (err.code === "ERR_TLS_CERT_ALTNAME_INVALID") {
-        assert(client[kRunning] === 0);
+        const running = client[kQueue].splice(client[kRunningIdx], client[kRunning]);
+        client[kPendingIdx] = client[kRunningIdx];
+        for (let i = 0; i < running.length; i++) {
+          util.errorRequest(client, running[i], err);
+        }
         while (client[kPending] > 0 && client[kQueue][client[kPendingIdx]].servername === client[kServerName]) {
-          const request = client[kQueue][client[kPendingIdx]++];
+          const request = client[kQueue].splice(client[kPendingIdx], 1)[0];
           util.errorRequest(client, request, err);
         }
       } else {
